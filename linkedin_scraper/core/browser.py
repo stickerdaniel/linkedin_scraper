@@ -2,20 +2,27 @@
 
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from patchright.async_api import async_playwright, BrowserContext, Page, Playwright
 
 from .exceptions import NetworkError
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_USER_DATA_DIR = Path.home() / ".linkedin_scraper" / "browser_data"
+
 
 class BrowserManager:
-    """Async context manager for Patchright browser with persistent profile."""
+    """Async context manager for Patchright browser with persistent profile.
+
+    Session persistence is handled automatically by the persistent browser
+    context — all cookies, localStorage, and session state are retained in
+    the ``user_data_dir`` between runs. No explicit save/load is needed.
+    """
 
     def __init__(
         self,
-        user_data_dir: str | Path,
+        user_data_dir: Union[str, Path] = _DEFAULT_USER_DATA_DIR,
         headless: bool = True,
         slow_mo: int = 0,
         viewport: Optional[Dict[str, int]] = None,
@@ -26,7 +33,8 @@ class BrowserManager:
         Initialize browser manager with persistent context.
 
         Args:
-            user_data_dir: Path to Chromium user data directory (persistent profile)
+            user_data_dir: Path to Chromium user data directory (persistent profile).
+                Defaults to ``~/.linkedin_scraper/browser_data``.
             headless: Run browser in headless mode
             slow_mo: Slow down operations by specified milliseconds
             viewport: Browser viewport size (default: 1280x720)
@@ -173,7 +181,7 @@ class BrowserManager:
 
     @property
     def is_authenticated(self) -> bool:
-        """Check if user is authenticated."""
+        """Check if user is authenticated (tracked state, not a live check)."""
         return self._is_authenticated
 
     @is_authenticated.setter

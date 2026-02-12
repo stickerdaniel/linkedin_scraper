@@ -3,7 +3,7 @@
 import asyncio
 import functools
 import logging
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Literal, Optional, TypeVar, cast
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from .exceptions import RateLimitError, ElementNotFoundError, NetworkError
@@ -49,6 +49,7 @@ def retry_async(
                         logger.error(
                             f"All {max_attempts} attempts failed for {func.__name__}"
                         )
+            assert last_exception is not None
             raise last_exception
         return wrapper
     return decorator
@@ -59,7 +60,7 @@ async def detect_rate_limit(page: Page) -> None:
     Detect if LinkedIn has rate limited the session.
     
     Args:
-        page: Playwright page object
+        page: Patchright page object
         
     Raises:
         RateLimitError: If rate limiting is detected
@@ -83,8 +84,12 @@ async def detect_rate_limit(page: Page) -> None:
                 "CAPTCHA challenge detected. Manual intervention required.",
                 suggested_wait_time=3600
             )
-    except Exception:
+    except RateLimitError:
+        raise
+    except PlaywrightTimeoutError:
         pass
+    except Exception as e:
+        logger.debug(f"Error checking for CAPTCHA: {e}")
     
     # Check for rate limit messages
     try:
@@ -109,14 +114,14 @@ async def wait_for_element_smart(
     page: Page,
     selector: str,
     timeout: float = 5000,
-    state: str = "visible",
+    state: Literal["attached", "detached", "hidden", "visible"] = "visible",
     error_context: Optional[str] = None
 ) -> None:
     """
     Wait for an element with better error messages.
     
     Args:
-        page: Playwright page object
+        page: Patchright page object
         selector: CSS selector or text selector
         timeout: Timeout in milliseconds
         state: Element state to wait for (visible, attached, hidden, detached)
@@ -161,7 +166,7 @@ async def extract_text_safe(
     Safely extract text from an element, returning default if not found.
     
     Args:
-        page: Playwright page object
+        page: Patchright page object
         selector: CSS selector
         default: Default value if element not found
         timeout: Timeout in milliseconds
@@ -186,7 +191,7 @@ async def scroll_to_bottom(page: Page, pause_time: float = 1.0, max_scrolls: int
     Scroll to the bottom of the page smoothly with pauses.
     
     Args:
-        page: Playwright page object
+        page: Patchright page object
         pause_time: Time to pause between scrolls (seconds)
         max_scrolls: Maximum number of scroll attempts
     """
@@ -215,7 +220,7 @@ async def click_see_more_buttons(page: Page, max_attempts: int = 10) -> int:
     Click all 'Show more' / 'See more' buttons on the page.
     
     Args:
-        page: Playwright page object
+        page: Patchright page object
         max_attempts: Maximum number of buttons to click
         
     Returns:
@@ -233,7 +238,10 @@ async def click_see_more_buttons(page: Page, max_attempts: int = 10) -> int:
                 clicked += 1
             else:
                 break
-        except:
+        except PlaywrightTimeoutError:
+            break
+        except Exception as e:
+            logger.debug(f"Error clicking see more button: {e}")
             break
     
     if clicked > 0:
@@ -247,7 +255,7 @@ async def handle_modal_close(page: Page) -> bool:
     Close any popup modals that might be blocking content.
     
     Args:
-        page: Playwright page object
+        page: Patchright page object
         
     Returns:
         True if a modal was closed, False otherwise
@@ -265,8 +273,10 @@ async def handle_modal_close(page: Page) -> bool:
             await asyncio.sleep(0.5)
             logger.debug("Closed modal")
             return True
-    except:
+    except PlaywrightTimeoutError:
         pass
+    except Exception as e:
+        logger.debug(f"Error closing modal: {e}")
     
     return False
 
@@ -276,7 +286,7 @@ async def is_page_loaded(page: Page) -> bool:
     Check if page has finished loading.
     
     Args:
-        page: Playwright page object
+        page: Patchright page object
         
     Returns:
         True if page is loaded
@@ -284,5 +294,8 @@ async def is_page_loaded(page: Page) -> bool:
     try:
         state = await page.evaluate('document.readyState')
         return state == 'complete'
-    except:
+    except PlaywrightTimeoutError:
+        return False
+    except Exception as e:
+        logger.debug(f"Error checking page load state: {e}")
         return False
