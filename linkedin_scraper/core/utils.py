@@ -4,7 +4,7 @@ import asyncio
 import functools
 import logging
 from typing import Any, Callable, Optional, TypeVar, cast
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from .exceptions import RateLimitError, ElementNotFoundError, NetworkError
 

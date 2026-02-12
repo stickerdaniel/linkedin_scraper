@@ -5,7 +5,7 @@ Extracts company information from LinkedIn company pages.
 """
 import logging
 from typing import Optional
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 from ..models.company import Company
 from ..core.exceptions import ProfileNotFoundError

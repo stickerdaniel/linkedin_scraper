@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 from urllib.parse import urljoin
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 from .base import BaseScraper
 from ..models import Person, Experience, Education, Accomplishment, Interest, Contact

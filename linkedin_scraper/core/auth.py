@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from typing import Optional, Tuple
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from dotenv import load_dotenv
 
 from .exceptions import AuthenticationError

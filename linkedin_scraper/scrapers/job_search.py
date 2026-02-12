@@ -6,7 +6,7 @@ Searches for jobs on LinkedIn and extracts job URLs.
 import logging
 from typing import Optional, List
 from urllib.parse import urlencode
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 from ..callbacks import ProgressCallback, SilentCallback
 from .base import BaseScraper

@@ -1,7 +1,7 @@
 import logging
 import re
 from typing import List, Optional
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 from ..models.post import Post
 from ..callbacks import ProgressCallback, SilentCallback

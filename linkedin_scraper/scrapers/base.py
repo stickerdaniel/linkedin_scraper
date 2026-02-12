@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from typing import Optional
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from ..callbacks import ProgressCallback, SilentCallback
 from ..core import (

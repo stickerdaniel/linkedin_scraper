@@ -5,7 +5,7 @@ Extracts job posting information from LinkedIn job pages.
 """
 import logging
 from typing import Optional
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 from ..models.job import Job
 from ..core.exceptions import ProfileNotFoundError
