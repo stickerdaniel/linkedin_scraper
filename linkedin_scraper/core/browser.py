@@ -194,12 +194,28 @@ class BrowserManager:
         """Get default cookie file path (parent of user_data_dir)."""
         return Path(self.user_data_dir).parent / "cookies.json"
 
+    @staticmethod
+    def _normalize_cookie_domain(cookie: dict) -> dict:
+        """Normalize cookie domain for cross-platform compatibility.
+
+        Playwright reports some LinkedIn cookies with ``.www.linkedin.com``
+        domain, but Chromium's internal store uses ``.linkedin.com``. This
+        mismatch causes cookies to not be sent on Linux after import.
+        """
+        domain = cookie.get("domain", "")
+        if domain in (".www.linkedin.com", "www.linkedin.com"):
+            cookie = {**cookie, "domain": ".linkedin.com"}
+        return cookie
+
     async def export_cookies(self, cookie_path: Optional[Union[str, Path]] = None) -> bool:
         """
         Export cookies from browser context to a portable JSON file.
 
         Enables cross-platform profile portability — Chromium encrypts cookies
         with OS-specific keys, so the JSON file bridges macOS and Linux Docker.
+
+        Only exports LinkedIn-domain cookies with normalized domains so they
+        work correctly when imported on a different platform.
 
         Args:
             cookie_path: Path to cookie file. Defaults to ``{user_data_dir}/../cookies.json``.
@@ -213,21 +229,32 @@ class BrowserManager:
 
         path = Path(cookie_path) if cookie_path else self._default_cookie_path()
         try:
-            cookies = await self._context.cookies()
+            all_cookies = await self._context.cookies()
+            # Filter to LinkedIn cookies and normalize domains
+            cookies = [
+                self._normalize_cookie_domain(c) for c in all_cookies
+                if "linkedin.com" in c.get("domain", "")
+            ]
             path.write_text(json.dumps(cookies, indent=2))
-            logger.info("Exported %d cookies to %s", len(cookies), path)
+            logger.info("Exported %d LinkedIn cookies to %s", len(cookies), path)
             return True
         except Exception:
             logger.exception("Failed to export cookies")
             return False
 
+    # Auth cookies to import — everything else is regenerated fresh by the
+    # server, avoiding conflicts with anti-bot (PerimeterX, Cloudflare) and
+    # datacenter routing cookies that are tied to the original session.
+    _AUTH_COOKIE_NAMES = frozenset({"li_at", "li_rm"})
+
     async def import_cookies(self, cookie_path: Optional[Union[str, Path]] = None) -> bool:
         """
-        Import cookies from a portable JSON file into the browser context.
+        Import auth cookies from a portable JSON file into the browser context.
 
-        Used on startup when persistent profile cookies can't be decrypted
-        (cross-platform scenario). The full profile (history, cache, fingerprint)
-        is still loaded from the persistent context.
+        Only imports essential authentication cookies (``li_at``, ``li_rm``).
+        All other cookies (anti-bot, routing, session IDs) are left for the
+        server to regenerate fresh, preventing redirect loops caused by stale
+        or platform-mismatched bot-detection state.
 
         Args:
             cookie_path: Path to cookie file. Defaults to ``{user_data_dir}/../cookies.json``.
@@ -245,13 +272,31 @@ class BrowserManager:
             return False
 
         try:
-            cookies = json.loads(path.read_text())
-            if not cookies:
+            all_cookies = json.loads(path.read_text())
+            if not all_cookies:
                 logger.debug("Cookie file is empty")
                 return False
 
+            # Only import auth cookies with normalized domains
+            cookies = [
+                self._normalize_cookie_domain(c) for c in all_cookies
+                if c.get("name") in self._AUTH_COOKIE_NAMES
+            ]
+            if not cookies:
+                logger.warning("No auth cookies (li_at/li_rm) found in %s", path)
+                return False
+
+            # Clear undecryptable cookies from the persistent store first.
+            # On cross-platform (macOS profile on Linux), Chromium loads
+            # encrypted cookie entries it can't decrypt — these shadow any
+            # cookies we import via CDP and prevent them from being sent.
+            await self._context.clear_cookies()
             await self._context.add_cookies(cookies)
-            logger.info("Imported %d cookies from %s", len(cookies), path)
+            logger.info(
+                "Imported %d auth cookies from %s: %s",
+                len(cookies), path,
+                ", ".join(c["name"] for c in cookies),
+            )
             return True
         except Exception:
             logger.exception("Failed to import cookies from %s", path)
