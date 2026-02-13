@@ -1,0 +1,14 @@
+patchright>=1.40.0
+requests>=2.31.0
+lxml>=5.0.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+aiofiles>=23.0.0
+
+[dev]
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+build>=1.0.0
+twine>=4.0.0
+wheel>=0.40.0
