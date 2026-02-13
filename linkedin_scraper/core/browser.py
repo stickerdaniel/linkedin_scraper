@@ -1,5 +1,6 @@
 """Browser lifecycle management using Patchright with persistent context."""
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, Union
@@ -188,3 +189,75 @@ class BrowserManager:
     def is_authenticated(self, value: bool) -> None:
         """Set authentication status."""
         self._is_authenticated = value
+
+    def _default_cookie_path(self) -> Path:
+        """Get default cookie file path (parent of user_data_dir)."""
+        return Path(self.user_data_dir).parent / "cookies.json"
+
+    async def export_cookies(self, cookie_path: Optional[Union[str, Path]] = None) -> bool:
+        """
+        Export cookies from browser context to a portable JSON file.
+
+        Enables cross-platform profile portability — Chromium encrypts cookies
+        with OS-specific keys, so the JSON file bridges macOS and Linux Docker.
+
+        Args:
+            cookie_path: Path to cookie file. Defaults to ``{user_data_dir}/../cookies.json``.
+
+        Returns:
+            True if export succeeded
+        """
+        if not self._context:
+            logger.warning("Cannot export cookies: no browser context")
+            return False
+
+        path = Path(cookie_path) if cookie_path else self._default_cookie_path()
+        try:
+            cookies = await self._context.cookies()
+            path.write_text(json.dumps(cookies, indent=2))
+            logger.info("Exported %d cookies to %s", len(cookies), path)
+            return True
+        except Exception:
+            logger.exception("Failed to export cookies")
+            return False
+
+    async def import_cookies(self, cookie_path: Optional[Union[str, Path]] = None) -> bool:
+        """
+        Import cookies from a portable JSON file into the browser context.
+
+        Used on startup when persistent profile cookies can't be decrypted
+        (cross-platform scenario). The full profile (history, cache, fingerprint)
+        is still loaded from the persistent context.
+
+        Args:
+            cookie_path: Path to cookie file. Defaults to ``{user_data_dir}/../cookies.json``.
+
+        Returns:
+            True if cookies were imported
+        """
+        if not self._context:
+            logger.warning("Cannot import cookies: no browser context")
+            return False
+
+        path = Path(cookie_path) if cookie_path else self._default_cookie_path()
+        if not path.exists():
+            logger.debug("No portable cookie file at %s", path)
+            return False
+
+        try:
+            cookies = json.loads(path.read_text())
+            if not cookies:
+                logger.debug("Cookie file is empty")
+                return False
+
+            await self._context.add_cookies(cookies)
+            logger.info("Imported %d cookies from %s", len(cookies), path)
+            return True
+        except Exception:
+            logger.exception("Failed to import cookies from %s", path)
+            return False
+
+    def cookie_file_exists(self, cookie_path: Optional[Union[str, Path]] = None) -> bool:
+        """Check if a portable cookie file exists."""
+        path = Path(cookie_path) if cookie_path else self._default_cookie_path()
+        return path.exists()
