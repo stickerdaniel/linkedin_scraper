@@ -117,11 +117,43 @@ class PersonScraper(BaseScraper):
     async def _get_name_and_location(self) -> tuple[str, Optional[str]]:
         """Extract name and location from profile."""
         try:
-            name = await self.safe_extract_text("h1", default="Unknown")
+            # Try h1 first (old layout)
+            name = await self.safe_extract_text("h1", default="")
+            if not name:
+                # New layout: extract from page title ("Name | LinkedIn")
+                title = await self.page.title()
+                name = title.replace(" | LinkedIn", "").strip() if title else "Unknown"
+
+            # Try old selector first
             location = await self.safe_extract_text(
                 ".text-body-small.inline.t-black--light.break-words", default=""
             )
-            return name, location if location else None
+            if not location:
+                # New layout: find location <p> in top card section via JS
+                location = await self.page.evaluate("""() => {
+                    const main = document.querySelector(
+                        '[data-view-name="profile-main-level"]'
+                    );
+                    const section = main ? main.querySelector('section') : null;
+                    if (!section) return '';
+                    const ps = section.querySelectorAll('p');
+                    // Collect candidate p-tags up to "Contact info" boundary
+                    const candidates = [];
+                    for (const p of ps) {
+                        const t = p.textContent.trim();
+                        if (!t || t.length > 80 || t.length < 3) continue;
+                        if (t.includes('Contact')) break;
+                        if (t.includes('·') || t.includes('followers') ||
+                            t.includes('http') || t.includes('Premium') ||
+                            t.includes('Followed by'))
+                            continue;
+                        candidates.push(t);
+                    }
+                    // Last candidate = location (first = headline)
+                    return candidates.length >= 2
+                        ? candidates[candidates.length - 1] : '';
+                }""")
+            return name or "Unknown", location if location else None
         except Exception as e:
             logger.warning(f"Error getting name/location: {e}")
             return "Unknown", None
@@ -143,23 +175,29 @@ class PersonScraper(BaseScraper):
     async def _get_about(self) -> Optional[str]:
         """Extract about section."""
         try:
-            # Find the profile card that contains "About"
-            profile_cards = await self.page.locator(
-                '[data-view-name="profile-card"]'
-            ).all()
-
-            for card in profile_cards:
-                card_text = await card.inner_text()
-                # Check if this card contains "About" heading
-                if card_text.strip().startswith("About"):
-                    # Get the span with aria-hidden to avoid duplication
-                    about_spans = await card.locator('span[aria-hidden="true"]').all()
-                    # Skip the first span (it's the "About" heading), get the content
-                    if len(about_spans) > 1:
-                        about_text = await about_spans[1].text_content()
-                        return about_text.strip() if about_text else None
-
-            return None
+            about = await self.page.evaluate("""() => {
+                const h2s = document.querySelectorAll('h2');
+                for (const h2 of h2s) {
+                    if (h2.textContent.trim() !== 'About') continue;
+                    const section = h2.closest('section');
+                    if (!section) continue;
+                    // New layout: data-testid="expandable-text-box"
+                    const textBox = section.querySelector(
+                        '[data-testid="expandable-text-box"]'
+                    );
+                    if (textBox) return textBox.textContent.trim();
+                    // Old layout: span[aria-hidden="true"]
+                    const spans = section.querySelectorAll(
+                        'span[aria-hidden="true"]'
+                    );
+                    for (const span of spans) {
+                        const t = span.textContent.trim();
+                        if (t.length > 20 && t !== 'About') return t;
+                    }
+                }
+                return null;
+            }""")
+            return about
         except Exception as e:
             logger.debug(f"Error getting about section: {e}")
             return None
@@ -169,26 +207,104 @@ class PersonScraper(BaseScraper):
         experiences = []
 
         try:
-            experience_heading = self.page.locator('h2:has-text("Experience")').first
-            
-            if await experience_heading.count() > 0:
-                experience_section = experience_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
-                if await experience_section.count() == 0:
-                    experience_section = experience_heading.locator('xpath=ancestor::*[4]')
-                
-                if await experience_section.count() > 0:
-                    items = await experience_section.locator('ul > li, ol > li').all()
-                    
-                    for item in items:
-                        try:
-                            exp = await self._parse_main_page_experience(item)
-                            if exp:
-                                experiences.append(exp)
-                        except Exception as e:
-                            logger.debug(f"Error parsing experience from main page: {e}")
-                            continue
-            
+            # JS-based extraction: works with both old and new LinkedIn layouts
+            # Links come in pairs (logo + detail) sharing the same href.
+            # Detail links contain <p> tags with position, company, dates.
+            # Nested positions (multiple roles at one company) are grouped
+            # by href: the first entry is a company summary, rest are roles.
+            exp_data = await self.page.evaluate("""() => {
+                const h2s = document.querySelectorAll('h2');
+                for (const h2 of h2s) {
+                    if (h2.textContent.trim() !== 'Experience') continue;
+                    const section = h2.closest('section');
+                    if (!section) continue;
+
+                    const links = section.querySelectorAll('a');
+                    const seenHrefs = new Map();
+                    const grouped = new Map();
+
+                    for (const link of links) {
+                        const href = link.getAttribute('href') || '';
+                        const text = link.textContent.trim();
+                        if (!text) {
+                            seenHrefs.set(href, true);
+                            continue;
+                        }
+                        if (!seenHrefs.has(href)) continue;
+                        // Skip media/see-more links
+                        const dv = link.getAttribute('data-view-name') || '';
+                        if (dv && dv !== 'experience-company-logo-click')
+                            continue;
+
+                        let parts = Array.from(link.querySelectorAll('p'))
+                            .map(p => p.textContent.trim())
+                            .filter(t => t);
+                        if (parts.length < 1) {
+                            parts = link.innerText.split('\\n')
+                                .map(p => p.trim()).filter(p => p);
+                        }
+                        if (parts.length < 2) continue;
+
+                        if (!grouped.has(href)) grouped.set(href, []);
+                        grouped.get(href).push(parts);
+                    }
+
+                    const results = [];
+                    const durOnly = /^\\d+\\s+(yr|yrs|mo|mos)(\\s+\\d+\\s+(yr|yrs|mo|mos))?$/;
+
+                    for (const [href, entries] of grouped) {
+                        if (entries.length > 1 && entries[0].length >= 2
+                            && durOnly.test(entries[0][1])) {
+                            // Nested: first = company summary, rest = roles
+                            const companyName = entries[0][0];
+                            for (let i = 1; i < entries.length; i++) {
+                                const p = entries[i];
+                                results.push({
+                                    position: p[0],
+                                    company: companyName,
+                                    dates: p[1] || '',
+                                    location: p.length > 2 ? p[2] : '',
+                                    companyUrl: href,
+                                });
+                            }
+                        } else {
+                            // Single-position entries
+                            for (const p of entries) {
+                                results.push({
+                                    position: p[0],
+                                    company: p.length >= 3 ? p[1] : '',
+                                    dates: p.length >= 3 ? p[2] :
+                                        (p[1] || ''),
+                                    location: p.length > 3 ? p[3] : '',
+                                    companyUrl: href,
+                                });
+                            }
+                        }
+                    }
+                    return results;
+                }
+                return [];
+            }""")
+
+            for data in exp_data:
+                from_date, to_date, duration = self._parse_work_times(
+                    data.get("dates", "")
+                )
+                experiences.append(
+                    Experience(
+                        position_title=data["position"],
+                        institution_name=data["company"],
+                        linkedin_url=data.get("companyUrl"),
+                        from_date=from_date,
+                        to_date=to_date,
+                        duration=duration,
+                        location=data.get("location") or None,
+                        description=None,
+                    )
+                )
+
             if not experiences:
+                # Fallback: navigate to details page
                 exp_url = urljoin(base_url, "details/experience")
                 await self.navigate_and_wait(exp_url)
                 await self.page.wait_for_selector("main", timeout=10000)
@@ -197,16 +313,20 @@ class PersonScraper(BaseScraper):
                 await self.scroll_page_to_bottom(pause_time=0.5, max_scrolls=5)
 
                 items = []
-                main_element = self.page.locator('main')
+                main_element = self.page.locator("main")
                 if await main_element.count() > 0:
-                    list_items = await main_element.locator('list > listitem, ul > li').all()
+                    list_items = await main_element.locator(
+                        "list > listitem, ul > li"
+                    ).all()
                     if list_items:
                         items = list_items
-                
+
                 if not items:
                     old_list = self.page.locator(".pvs-list__container").first
                     if await old_list.count() > 0:
-                        items = await old_list.locator(".pvs-list__paged-list-item").all()
+                        items = await old_list.locator(
+                            ".pvs-list__paged-list-item"
+                        ).all()
 
                 for item in items:
                     try:
@@ -531,26 +651,76 @@ class PersonScraper(BaseScraper):
         educations = []
 
         try:
-            education_heading = self.page.locator('h2:has-text("Education")').first
-            
-            if await education_heading.count() > 0:
-                education_section = education_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
-                if await education_section.count() == 0:
-                    education_section = education_heading.locator('xpath=ancestor::*[4]')
-                
-                if await education_section.count() > 0:
-                    items = await education_section.locator('ul > li, ol > li').all()
-                    
-                    for item in items:
-                        try:
-                            edu = await self._parse_main_page_education(item)
-                            if edu:
-                                educations.append(edu)
-                        except Exception as e:
-                            logger.debug(f"Error parsing education from main page: {e}")
-                            continue
-            
+            # JS-based extraction: works with both old and new LinkedIn layouts
+            # Links come in pairs (logo + detail) sharing the same href.
+            edu_data = await self.page.evaluate("""() => {
+                const h2s = document.querySelectorAll('h2');
+                for (const h2 of h2s) {
+                    if (h2.textContent.trim() !== 'Education') continue;
+                    const section = h2.closest('section');
+                    if (!section) continue;
+
+                    const links = section.querySelectorAll(
+                        'a[href*="/school/"]'
+                    );
+                    const seenHrefs = new Map();
+                    const results = [];
+
+                    for (const link of links) {
+                        const href = link.getAttribute('href') || '';
+                        const text = link.textContent.trim();
+                        if (!text) {
+                            seenHrefs.set(href, true);
+                            continue;
+                        }
+                        if (!seenHrefs.has(href)) continue;
+
+                        let parts = Array.from(link.querySelectorAll('p'))
+                            .map(p => p.textContent.trim())
+                            .filter(t => t);
+                        if (parts.length < 1) {
+                            parts = link.innerText.split('\\n')
+                                .map(p => p.trim()).filter(p => p);
+                        }
+                        if (parts.length >= 1) {
+                            results.push({
+                                institution: parts[0],
+                                degree: parts.length >= 3 ? parts[1] : (
+                                    parts.length === 2 &&
+                                    !parts[1].match(/\\d{4}/)
+                                        ? parts[1] : null
+                                ),
+                                dates: parts.length >= 3 ? parts[2] : (
+                                    parts.length === 2 &&
+                                    parts[1].match(/\\d{4}/)
+                                        ? parts[1] : ''
+                                ),
+                                schoolUrl: href,
+                            });
+                        }
+                    }
+                    return results;
+                }
+                return [];
+            }""")
+
+            for data in edu_data:
+                from_date, to_date = self._parse_education_times(
+                    data.get("dates", "")
+                )
+                educations.append(
+                    Education(
+                        institution_name=data["institution"],
+                        degree=data.get("degree"),
+                        linkedin_url=data.get("schoolUrl"),
+                        from_date=from_date,
+                        to_date=to_date,
+                        description=None,
+                    )
+                )
+
             if not educations:
+                # Fallback: navigate to details page
                 edu_url = urljoin(base_url, "details/education")
                 await self.navigate_and_wait(edu_url)
                 await self.page.wait_for_selector("main", timeout=10000)
@@ -559,16 +729,20 @@ class PersonScraper(BaseScraper):
                 await self.scroll_page_to_bottom(pause_time=0.5, max_scrolls=5)
 
                 items = []
-                main_element = self.page.locator('main')
+                main_element = self.page.locator("main")
                 if await main_element.count() > 0:
-                    list_items = await main_element.locator('ul > li, ol > li').all()
+                    list_items = await main_element.locator(
+                        "ul > li, ol > li"
+                    ).all()
                     if list_items:
                         items = list_items
-                
+
                 if not items:
                     old_list = self.page.locator(".pvs-list__container").first
                     if await old_list.count() > 0:
-                        items = await old_list.locator(".pvs-list__paged-list-item").all()
+                        items = await old_list.locator(
+                            ".pvs-list__paged-list-item"
+                        ).all()
 
                 for item in items:
                     try:
@@ -748,11 +922,13 @@ class PersonScraper(BaseScraper):
             return None, None
 
         try:
-            # Split by " - " to get from and to dates
-            if " - " in times:
-                parts = times.split(" - ")
-                from_date = parts[0].strip()
-                to_date = parts[1].strip() if len(parts) > 1 else ""
+            # Split by " - " or " – " (en-dash) to get from and to dates
+            import re as _re
+
+            date_parts = _re.split(r"\s*[-–]\s*", times)
+            if len(date_parts) >= 2:
+                from_date = date_parts[0].strip()
+                to_date = date_parts[1].strip()
             else:
                 # Single year
                 from_date = times.strip()
@@ -764,58 +940,72 @@ class PersonScraper(BaseScraper):
             return None, None
 
     async def _get_interests(self, base_url: str) -> list[Interest]:
-        """Extract interests from the main profile page Interests section with tablist."""
+        """Extract interests from the main profile page Interests section."""
         interests = []
 
         try:
-            interests_heading = self.page.locator('h2:has-text("Interests")').first
-            
-            if await interests_heading.count() > 0:
-                interests_section = interests_heading.locator('xpath=ancestor::*[.//tablist or .//*[@role="tablist"]][1]')
-                if await interests_section.count() == 0:
-                    interests_section = interests_heading.locator('xpath=ancestor::*[4]')
-                
-                tabs = await interests_section.locator('[role="tab"], tab').all() if await interests_section.count() > 0 else []
-                
-                if tabs:
-                    for tab in tabs:
-                        try:
-                            tab_name = await tab.text_content()
-                            if not tab_name:
-                                continue
-                            tab_name = tab_name.strip()
-                            category = self._map_interest_tab_to_category(tab_name)
+            # JS-based extraction: works with new (radio) and old (tab) layouts
+            interest_data = await self.page.evaluate("""() => {
+                const h2s = document.querySelectorAll('h2');
+                for (const h2 of h2s) {
+                    if (h2.textContent.trim() !== 'Interests') continue;
+                    const section = h2.closest('section');
+                    if (!section) continue;
 
-                            await tab.click()
-                            await self.wait_and_focus(0.5)
+                    const results = [];
+                    const links = section.querySelectorAll('a[href]');
+                    for (const link of links) {
+                        const href = link.getAttribute('href') || '';
+                        if (!href || href.includes('#')) continue;
+                        // Use first <p> tag for clean name, fallback
+                        // to first line of innerText
+                        const firstP = link.querySelector('p');
+                        let name = firstP
+                            ? firstP.textContent.trim()
+                            : '';
+                        if (!name) {
+                            const lines = link.innerText.split('\\n')
+                                .map(l => l.trim()).filter(l => l);
+                            name = lines[0] || '';
+                        }
+                        // Strip connection degree suffix (e.g. "· 3rd+")
+                        name = name.replace(/\\s*·\\s*\\d+\\w*\\+?$/, '');
+                        if (name && name.length > 2 && name.length < 150) {
+                            results.push({ name: name, url: href });
+                        }
+                    }
+                    return results;
+                }
+                return [];
+            }""")
 
-                            tabpanel = interests_section.locator('[role="tabpanel"]').first
-                            if await tabpanel.count() > 0:
-                                list_items = await tabpanel.locator('li, listitem').all()
-                                
-                                for item in list_items:
-                                    try:
-                                        interest = await self._parse_interest_item(item, category)
-                                        if interest:
-                                            interests.append(interest)
-                                    except Exception as e:
-                                        logger.debug(f"Error parsing interest item: {e}")
-                                        continue
-                        except Exception as e:
-                            logger.debug(f"Error processing interest tab: {e}")
-                            continue
-            
+            for data in interest_data:
+                url = data.get("url", "")
+                category = "influencer"
+                if "/company/" in url:
+                    category = "company"
+                elif "/school/" in url:
+                    category = "school"
+                elif "/groups/" in url:
+                    category = "group"
+                interests.append(
+                    Interest(
+                        name=data["name"],
+                        category=category,
+                        linkedin_url=url,
+                    )
+                )
+
             if not interests:
+                # Fallback: navigate to details page with tab interaction
                 interests_url = urljoin(base_url, "details/interests/")
                 await self.navigate_and_wait(interests_url)
                 await self.page.wait_for_selector("main", timeout=10000)
                 await self.wait_and_focus(1.5)
 
-                tabs = await self.page.locator('[role="tab"], tab').all()
-
-                if not tabs:
-                    logger.debug("No interests tabs found on profile")
-                    return interests
+                tabs = await self.page.locator(
+                    '[role="tab"], [role="radio"], tab'
+                ).all()
 
                 for tab in tabs:
                     try:
@@ -828,16 +1018,24 @@ class PersonScraper(BaseScraper):
                         await tab.click()
                         await self.wait_and_focus(0.8)
 
-                        tabpanel = self.page.locator('[role="tabpanel"], tabpanel').first
-                        list_items = await tabpanel.locator("listitem, li, .pvs-list__paged-list-item").all()
+                        tabpanel = self.page.locator(
+                            '[role="tabpanel"], tabpanel'
+                        ).first
+                        list_items = await tabpanel.locator(
+                            "listitem, li, .pvs-list__paged-list-item"
+                        ).all()
 
                         for item in list_items:
                             try:
-                                interest = await self._parse_interest_item(item, category)
+                                interest = await self._parse_interest_item(
+                                    item, category
+                                )
                                 if interest:
                                     interests.append(interest)
                             except Exception as e:
-                                logger.debug(f"Error parsing interest item: {e}")
+                                logger.debug(
+                                    f"Error parsing interest item: {e}"
+                                )
                                 continue
 
                     except Exception as e:
@@ -1042,68 +1240,84 @@ class PersonScraper(BaseScraper):
                 logger.warning("Contact info dialog not found")
                 return contacts
 
-            contact_sections = await dialog.locator('h3').all()
-            
-            for section_heading in contact_sections:
-                try:
-                    heading_text = await section_heading.text_content()
-                    if not heading_text:
-                        continue
-                    heading_text = heading_text.strip().lower()
-                    
-                    section_container = section_heading.locator('xpath=ancestor::*[1]')
-                    if await section_container.count() == 0:
-                        continue
-                    
-                    contact_type = self._map_contact_heading_to_type(heading_text)
-                    if not contact_type:
-                        continue
-                    
-                    links = await section_container.locator('a').all()
-                    for link in links:
-                        href = await link.get_attribute('href')
-                        text = await link.text_content()
-                        if href and text:
-                            text = text.strip()
-                            label = None
-                            sibling_text = await section_container.locator('span, generic').all()
-                            for sib in sibling_text:
-                                sib_text = await sib.text_content()
-                                if sib_text and sib_text.strip().startswith('(') and sib_text.strip().endswith(')'):
-                                    label = sib_text.strip()[1:-1]
-                                    break
-                            
-                            if contact_type == "linkedin":
-                                contacts.append(Contact(type=contact_type, value=href, label=label))
-                            elif contact_type == "email" and "mailto:" in href:
-                                contacts.append(Contact(type=contact_type, value=href.replace("mailto:", ""), label=label))
-                            else:
-                                contacts.append(Contact(type=contact_type, value=text, label=label))
-                    
-                    if contact_type == "birthday" and not links:
-                        birthday_text = await section_container.text_content()
-                        if birthday_text:
-                            birthday_value = birthday_text.replace(heading_text, "").replace("Birthday", "").strip()
-                            if birthday_value:
-                                contacts.append(Contact(type="birthday", value=birthday_value))
-                    
-                    if contact_type == "phone" and not links:
-                        phone_text = await section_container.text_content()
-                        if phone_text:
-                            phone_value = phone_text.replace(heading_text, "").replace("Phone", "").strip()
-                            if phone_value:
-                                contacts.append(Contact(type="phone", value=phone_value))
-                    
-                    if contact_type == "address" and not links:
-                        address_text = await section_container.text_content()
-                        if address_text:
-                            address_value = address_text.replace(heading_text, "").replace("Address", "").strip()
-                            if address_value:
-                                contacts.append(Contact(type="address", value=address_value))
-                                
-                except Exception as e:
-                    logger.debug(f"Error parsing contact section: {e}")
+            # JS-based extraction using innerText parsing
+            # The dialog text follows a pattern: "label\nvalue\nlabel\nvalue..."
+            contact_data = await dialog.evaluate("""(el) => {
+                const results = [];
+                const links = el.querySelectorAll('a[href]');
+                for (const link of links) {
+                    const href = link.getAttribute('href') || '';
+                    const text = link.textContent.trim();
+                    if (!text || href.includes('premium')) continue;
+                    results.push({ href, text });
+                }
+                // Parse innerText for non-link contacts (birthday, phone, etc.)
+                const fullText = el.innerText;
+                const birthdayMatch = fullText.match(
+                    /Birthday\\n+([A-Z][a-z]+ \\d{1,2})/
+                );
+                if (birthdayMatch) {
+                    results.push({
+                        type: 'birthday', value: birthdayMatch[1]
+                    });
+                }
+                const phoneMatch = fullText.match(
+                    /Phone\\n+([\\d\\s\\-+()]+)/
+                );
+                if (phoneMatch) {
+                    results.push({
+                        type: 'phone', value: phoneMatch[1].trim()
+                    });
+                }
+                const addressMatch = fullText.match(
+                    /Address\\n+(.+?)(?:\\n|$)/
+                );
+                if (addressMatch) {
+                    results.push({
+                        type: 'address', value: addressMatch[1].trim()
+                    });
+                }
+                return results;
+            }""")
+
+            for data in contact_data:
+                if "type" in data:
+                    # Pre-typed entries (birthday, phone, address)
+                    contacts.append(
+                        Contact(type=data["type"], value=data["value"])
+                    )
                     continue
+
+                href = data.get("href", "")
+                text = data.get("text", "")
+                label_match = None
+                if "(" in text and ")" in text:
+                    import re
+                    m = re.search(r"\(([^)]+)\)", text)
+                    if m:
+                        label_match = m.group(1)
+                        text = text.replace(m.group(0), "").strip()
+
+                if "/in/" in href:
+                    contacts.append(
+                        Contact(
+                            type="linkedin", value=href, label=label_match
+                        )
+                    )
+                elif "mailto:" in href:
+                    contacts.append(
+                        Contact(
+                            type="email",
+                            value=href.replace("mailto:", ""),
+                            label=label_match,
+                        )
+                    )
+                elif href.startswith("http"):
+                    contacts.append(
+                        Contact(
+                            type="website", value=text, label=label_match
+                        )
+                    )
 
         except Exception as e:
             logger.warning(f"Error getting contacts: {e}")

@@ -43,3 +43,5 @@ MANIFEST.ini
 # Basic package build artifacts
 build-basic/
 dist-basic/
+
+.opencode/
